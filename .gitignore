@@ -1,0 +1,12 @@
+.env
+
+# Go build and test output
+/bin/
+*.exe
+*.test
+*.out
+coverage.txt
+
+# Editors
+.idea/
+.vscode/
