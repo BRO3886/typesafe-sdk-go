@@ -1,9 +1,11 @@
 package typesafe
 
 import (
+	"bytes"
 	"context"
 	"log/slog"
 	"net/http"
+	"strings"
 	"testing"
 )
 
@@ -54,6 +56,27 @@ func TestRedactHeader(t *testing.T) {
 		if redacted[name] != expected {
 			t.Errorf("redactHeader()[%q] = %q, want %q", name, redacted[name], expected)
 		}
+	}
+}
+
+func TestDebugLoggingRedactsCredentials(t *testing.T) {
+	var logged bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logged, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	client := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(t, w, http.StatusOK, `{"model":"jev-1","usage":{},"answers":{"a":{"type":"noul","noul":0.4}}}`)
+	}, WithLogger(logger))
+
+	if _, err := client.SystemOne(context.Background(), "state", Questions{"a": Noul{}}); err != nil {
+		t.Fatalf("SystemOne() error = %v", err)
+	}
+
+	output := logged.String()
+	if strings.Contains(output, "test-key") {
+		t.Error("debug logs leaked the API key")
+	}
+	if !strings.Contains(output, "Bearer ***") {
+		t.Errorf("debug logs did not show a redacted credential, got:\n%s", output)
 	}
 }
 
