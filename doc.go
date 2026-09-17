@@ -23,7 +23,7 @@
 //	}
 //	fmt.Println(resp.Choices()["category"].Choice)
 //
-// Every call takes a [context.Context]: cancelling it aborts the request and
+// Every call takes a [context.Context]: canceling it aborts the request and
 // any pending retry, and its deadline bounds the call as a whole, including
 // backoff. The per-attempt timeout is configured separately with [WithTimeout].
 //

@@ -1,0 +1,167 @@
+package typesafe
+
+import (
+	"errors"
+	"math"
+	"math/rand"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// RetryPolicy controls how failed attempts are retried. Start from
+// [DefaultRetryPolicy] and change the fields you care about; a zero RetryPolicy
+// disables retries entirely.
+//
+//	policy := typesafe.DefaultRetryPolicy()
+//	policy.MaxRetries = 5
+//	client, err := typesafe.New(typesafe.WithRetry(policy))
+//
+// There is no total retry budget: bound the whole call, attempts and backoff
+// together, with a context deadline.
+type RetryPolicy struct {
+	// MaxRetries is the number of retries after the initial attempt; 0 disables
+	// retries.
+	MaxRetries int
+	// BackoffInitial is the first backoff delay, doubled each attempt up to
+	// BackoffMax; zero disables backoff.
+	BackoffInitial time.Duration
+	// BackoffMax caps the backoff delay.
+	BackoffMax time.Duration
+	// BackoffJitter is the fraction of each backoff delay randomly subtracted,
+	// from 0 to 1.
+	BackoffJitter float64
+	// RetryStatus reports whether a response status should be retried. When nil,
+	// [DefaultRetryStatus] applies.
+	RetryStatus func(status int) bool
+	// RespectRetryAfter honors the retry-after-ms and Retry-After response
+	// headers in place of backoff.
+	RespectRetryAfter bool
+	// MaxRetryAfter caps the server-requested delay; a longer one falls back to
+	// backoff.
+	MaxRetryAfter time.Duration
+	// RetryConnectionErrors retries a [ConnectionError], including a response
+	// body that stopped arriving midway.
+	RetryConnectionErrors bool
+	// RetryTimeoutErrors retries a [TimeoutError].
+	RetryTimeoutErrors bool
+
+	// rand supplies the jitter fraction; tests replace it to remove randomness.
+	rand func() float64
+}
+
+// DefaultRetryPolicy returns the SDK defaults: two retries with exponential
+// backoff from 500ms to 5s, honoring Retry-After up to a minute, for HTTP 408,
+// 429 and 5xx responses as well as connection errors and timeouts.
+func DefaultRetryPolicy() RetryPolicy {
+	return RetryPolicy{
+		MaxRetries:            2,
+		BackoffInitial:        500 * time.Millisecond,
+		BackoffMax:            5 * time.Second,
+		BackoffJitter:         0.25,
+		RetryStatus:           DefaultRetryStatus,
+		RespectRetryAfter:     true,
+		MaxRetryAfter:         60 * time.Second,
+		RetryConnectionErrors: true,
+		RetryTimeoutErrors:    true,
+	}
+}
+
+// DefaultRetryStatus reports whether a status is retried by default: 408, 429,
+// and any 5xx.
+func DefaultRetryStatus(status int) bool {
+	return status == http.StatusRequestTimeout ||
+		status == http.StatusTooManyRequests ||
+		status >= http.StatusInternalServerError
+}
+
+func (p RetryPolicy) validate() error {
+	if p.MaxRetries < 0 {
+		return newError("retry MaxRetries must not be negative, got %d", p.MaxRetries)
+	}
+	if p.BackoffInitial < 0 {
+		return newError("retry BackoffInitial must not be negative, got %s", p.BackoffInitial)
+	}
+	if p.BackoffMax < 0 {
+		return newError("retry BackoffMax must not be negative, got %s", p.BackoffMax)
+	}
+	if p.MaxRetryAfter < 0 {
+		return newError("retry MaxRetryAfter must not be negative, got %s", p.MaxRetryAfter)
+	}
+	if p.BackoffJitter < 0 || p.BackoffJitter > 1 || math.IsNaN(p.BackoffJitter) {
+		return newError("retry BackoffJitter must be between 0 and 1, got %v", p.BackoffJitter)
+	}
+	return nil
+}
+
+func (p RetryPolicy) retriesStatus(status int) bool {
+	if p.RetryStatus == nil {
+		return DefaultRetryStatus(status)
+	}
+	return p.RetryStatus(status)
+}
+
+func (p RetryPolicy) retriesError(err error) bool {
+	var timeout *TimeoutError
+	if errors.As(err, &timeout) {
+		return p.RetryTimeoutErrors
+	}
+	var connection *ConnectionError
+	if errors.As(err, &connection) {
+		return p.RetryConnectionErrors
+	}
+	return false
+}
+
+// delay returns how long to wait before the retry following a zero-based
+// attempt, preferring a server-requested delay within MaxRetryAfter.
+func (p RetryPolicy) delay(attempt int, header http.Header, now time.Time) time.Duration {
+	if p.RespectRetryAfter && header != nil {
+		if requested, ok := parseRetryAfter(header, now); ok && requested <= p.MaxRetryAfter {
+			return requested
+		}
+	}
+	return p.backoff(attempt)
+}
+
+func (p RetryPolicy) backoff(attempt int) time.Duration {
+	if p.BackoffInitial <= 0 || p.BackoffMax <= 0 {
+		return 0
+	}
+	exponential := p.BackoffMax
+	if attempt < 62 {
+		if scaled := p.BackoffInitial << uint(attempt); scaled > 0 && scaled < p.BackoffMax {
+			exponential = scaled
+		}
+	}
+	random := rand.Float64
+	if p.rand != nil {
+		random = p.rand
+	}
+	return time.Duration(float64(exponential) * (1 - random()*p.BackoffJitter))
+}
+
+// parseRetryAfter reads retry-after-ms, then Retry-After as either seconds or an
+// HTTP date.
+func parseRetryAfter(header http.Header, now time.Time) (time.Duration, bool) {
+	if raw := strings.TrimSpace(header.Get("Retry-After-Ms")); raw != "" {
+		if ms, err := strconv.ParseFloat(raw, 64); err == nil && ms >= 0 && !math.IsInf(ms, 0) {
+			return time.Duration(ms * float64(time.Millisecond)), true
+		}
+	}
+	raw := strings.TrimSpace(header.Get("Retry-After"))
+	if raw == "" {
+		return 0, false
+	}
+	if seconds, err := strconv.ParseFloat(raw, 64); err == nil {
+		if seconds < 0 || math.IsInf(seconds, 0) || math.IsNaN(seconds) {
+			return 0, false
+		}
+		return time.Duration(seconds * float64(time.Second)), true
+	}
+	if at, err := http.ParseTime(raw); err == nil {
+		return max(0, at.Sub(now)), true
+	}
+	return 0, false
+}
