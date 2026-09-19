@@ -33,7 +33,11 @@ func (c *Client) send(ctx context.Context, method, path string, payload any, o *
 			attemptHeader = header.Clone()
 			attemptHeader.Set(retryCountHeader, strconv.Itoa(attempt))
 		}
-		c.logDebugBody(tag+" request", url, redactHeader(attemptHeader), body)
+		if c.logBodies {
+			c.logger.Debug(tag+" request", "url", url, "headers", redactHeader(attemptHeader), "body", string(body))
+		} else {
+			c.logger.Debug(tag+" request", "url", url, "headers", redactHeader(attemptHeader), "body_omitted", true)
+		}
 
 		started := time.Now()
 		resp, raw, err := c.attempt(ctx, method, url, body, attemptHeader, o.timeout)
@@ -50,7 +54,11 @@ func (c *Client) send(ctx context.Context, method, path string, payload any, o *
 
 		requestID := resp.Header.Get(requestIDHeader)
 		c.logger.Info(tag+" response", "status", resp.StatusCode, "in", time.Since(started), "request_id", requestID)
-		c.logDebugBody(tag+" response body", "", redactHeader(resp.Header), raw)
+		if c.logBodies {
+			c.logger.Debug(tag+" response body", "headers", redactHeader(resp.Header), "body", string(raw))
+		} else {
+			c.logger.Debug(tag+" response body", "headers", redactHeader(resp.Header), "body_omitted", true)
+		}
 
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			return &response{http: resp, body: raw, endpoint: endpoint, requestID: requestID, logger: c.logger}, nil
@@ -64,22 +72,6 @@ func (c *Client) send(ctx context.Context, method, path string, payload any, o *
 			return nil, err
 		}
 	}
-}
-
-func (c *Client) logDebugBody(message, url string, headers map[string]string, body []byte) {
-	if c.logBodies {
-		if url != "" {
-			c.logger.Debug(message, "url", url, "headers", headers, "body", string(body))
-			return
-		}
-		c.logger.Debug(message, "headers", headers, "body", string(body))
-		return
-	}
-	if url != "" {
-		c.logger.Debug(message, "url", url, "headers", headers, "body_omitted", true)
-		return
-	}
-	c.logger.Debug(message, "headers", headers, "body_omitted", true)
 }
 
 // attempt performs one round trip, reading the whole body under the per-attempt
